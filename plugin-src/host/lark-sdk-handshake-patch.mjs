@@ -139,6 +139,81 @@ const PATCHES = [
             }
             // Clear any terminal-error state left over from a previous session so`,
   },
+  {
+    label: 'WSClient card-frame type gate',
+    before: `            if (type !== MessageType.event) {
+                return;
+            }`,
+    after: `            try {
+                this.logger.warn('[ws]', 'data-frame type=' + String(type)
+                    + ' headers=' + JSON.stringify(headers ?? null)
+                    + ' payload=' + JSON.stringify(payload ?? null));
+            } catch (e) { /* debug logging must never break delivery */ }
+            if (type !== MessageType.event && type !== MessageType.card) {
+                return;
+            }`,
+  },
+  {
+    label: 'WSClient card-frame merged-data mutability',
+    before: `            const mergedData = this.dataCache.mergeData({
+                message_id,
+                sum: Number(sum),
+                seq: Number(seq),
+                trace_id,
+                data: payload
+            });
+            if (!mergedData) {
+                return;
+            }
+            this.logger.debug('[ws]', \`receive message, message_type: \${type}; message_id: \${message_id}; trace_id: \${trace_id}; data: \${mergedData.data}\`);`,
+    after: `            let mergedData = this.dataCache.mergeData({
+                message_id,
+                sum: Number(sum),
+                seq: Number(seq),
+                trace_id,
+                data: payload
+            });
+            if (!mergedData) {
+                return;
+            }
+            // Feishu delivers interactive-card button callbacks
+            // (card.action.trigger) over the same persistent connection as a
+            // data frame whose header type is 'card' (not 'event'). The
+            // payload is the flat v2 card-action object
+            // ({ context, operator, action, token }) with no 'schema' / 'header'
+            // wrapper, so the EventDispatcher would otherwise fail to resolve a
+            // handler (no event_type). Normalize it into the standard v2 event
+            // envelope so 'card.action.trigger' reaches the registered handler.
+            if (type === MessageType.card && mergedData && typeof mergedData === 'object'
+                && !('schema' in mergedData) && !('header' in mergedData)) {
+                try {
+                    this.logger.warn('[ws]', 'card-frame received, action=' +
+                        JSON.stringify(mergedData.action ?? null) +
+                        ' operator=' + JSON.stringify(mergedData.operator ?? null) +
+                        ' ctx=' + JSON.stringify(mergedData.context ?? null));
+                } catch (e) { /* debug logging must never break delivery */ }
+                mergedData = {
+                    schema: '2.0',
+                    header: { event_type: 'card.action.trigger' },
+                    event: mergedData,
+                };
+            }
+            this.logger.debug('[ws]', \`receive message, message_type: \${type}; message_id: \${message_id}; trace_id: \${trace_id}; data: \${mergedData.data}\`);
+            try {
+              this.logger.warn('[ws]', 'pre-invoke event_type=' + JSON.stringify(mergedData?.header?.event_type ?? mergedData?.event?.type ?? null)
+                + ' hasSchema=' + ('schema' in (mergedData ?? {}))
+                + ' hasHeader=' + ('header' in (mergedData ?? {}))
+                + ' keys=' + JSON.stringify(Object.keys(mergedData ?? {}).slice(0, 10)));
+            } catch (e) { /* debug */ }`,
+  },
+  {
+    label: 'WSClient post-invoke result log',
+    before: `                const result = yield ((_a = this.eventDispatcher) === null || _a === void 0 ? void 0 : _a.invoke(mergedData, { needCheck: false }));`,
+    after: `                const result = yield ((_a = this.eventDispatcher) === null || _a === void 0 ? void 0 : _a.invoke(mergedData, { needCheck: false }));
+                if (typeof result === 'string' && result.startsWith('no ')) {
+                  try { this.logger.warn('[ws]', 'post-invoke result=' + result); } catch (e) { /* debug */ }
+                }`,
+  },
 ];
 
 function replaceExactlyOnce(source, patch, sourcePath) {
@@ -162,6 +237,14 @@ function replaceExactlyOnce(source, patch, sourcePath) {
  * connection stage with the reconnect generation already maintained by the
  * SDK. Every reviewed source fragment must match exactly once so an SDK source
  * change fails the build instead of silently losing the compatibility fix.
+ *
+ * Additionally, the vendor WSClient drops every data frame whose header
+ * `type` is `card` (interactive-card button callbacks). Feishu delivers
+ * `card.action.trigger` over the same persistent connection as a `card`-typed
+ * frame whose payload is the flat v2 action object, so those frames are
+ * accepted and re-wrapped into the standard v2 event envelope
+ * ({ schema, header: { event_type }, event }) that the EventDispatcher
+ * resolves to the registered `card.action.trigger` handler.
  */
 export function patchLarkSdkHandshakeSource(source, sourcePath = 'Lark SDK') {
   return PATCHES.reduce(

@@ -165,6 +165,8 @@ export async function createProductionController(ctx, config = {}, internals = {
       const workspaceScope = createBotWorkspaceScope(harness, {
         botId: id, workspaces, state, agentPresetCatalog,
       });
+      // authDir flows through normalizeBot → configStore → createRuntime → Runtime → Bridge
+      // (see src/channels/feishu/plugin-config-store.mjs for the normalizeBot field)
       return new Runtime({
         lark,
         botId: id,
@@ -178,6 +180,7 @@ export async function createProductionController(ctx, config = {}, internals = {
         harness: workspaceScope.harness,
         state: workspaceScope.state,
         replyTimeoutMs: config.replyTimeoutMs ?? 600_000,
+        authDir: botConfig.authDir ?? config.authDir ?? null,
         ...(wsAgent ? { wsAgent } : {}),
         logger: {
           error: (...args) => logger.error?.(`[${botId ?? botConfig.id}]`, ...args),

@@ -46,6 +46,15 @@ test('Lark SDK patch applies every reviewed lifecycle fix to both vendor builds'
       patched,
       /handshake timeout[^]*?wsInstance\.removeAllListeners\(\);[^]*?settleOnce\(false\);/u,
     );
+    assert.match(
+      patched,
+      /type !== MessageType\.event && type !== MessageType\.card/u,
+    );
+    assert.match(patched, /let mergedData = this\.dataCache\.mergeData/u);
+    assert.match(
+      patched,
+      /header: \{ event_type: 'card\.action\.trigger' \}/u,
+    );
   }
 });
 

@@ -67,5 +67,10 @@ export function loadConfig() {
       'FEISHU_ALLOWED_OPEN_IDS',
       process.env.FEISHU_ALLOWED_OPEN_IDS,
     ),
+    // Directory holding auth_request.py state files (<auth_id>.json).
+    // Empty/absent disables authorization-card handling entirely.
+    authDir: process.env.FEISHU_AUTH_DIR?.trim()
+      ? resolve(process.env.FEISHU_AUTH_DIR.trim())
+      : null,
   });
 }

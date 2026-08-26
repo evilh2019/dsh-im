@@ -5685,3 +5685,179 @@ test('menu stop and steer reply friendly when no session is bound', async () => 
   assert.equal(calls.steer.length, 0);
   assert.match(JSON.parse(sent.at(-1).content).text, /没有绑定会话/);
 });
+
+// ── Authorization cards (auth_request.py): buttons carry { auth_id, decision, grant } ──
+
+function authCardEvent(messageId, authId, decision, grant, operatorOpenId) {
+  return {
+    operator: { open_id: operatorOpenId },
+    action: { value: { auth_id: authId, decision, grant } },
+    context: { open_message_id: messageId },
+  };
+}
+
+test('an authorization card button approves a pending request and writes the state file', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-im-auth-'));
+  try {
+    const authId = 'auth-test-approve';
+    const stFile = join(dir, `${authId}.json`);
+    await writeFile(stFile, JSON.stringify({
+      id: authId,
+      status: 'pending',
+      desc: 'approve me',
+      risk: 'medium',
+      cmd: 'bash',
+      choices: ['once', 'deny'],
+      created_at: '2026-08-25T00:00:00.000000',
+      decision_at: null,
+      operator: null,
+      grant: null,
+    }));
+
+    const fixture = stateFixture();
+    const patches = [];
+    const bridge = new FeishuHarnessBridge({
+      client: cardClient(async () => undefined, async (request) => {
+        patches.push(request);
+        return { code: 0 };
+      }),
+      channel: {},
+      harness: sessionsHarness(1),
+      state: fixture.state,
+      status: bridgeStatus(),
+      allowedSenderOpenIds: new Set(['ou_owner']),
+      authDir: dir,
+    });
+
+    await bridge.onCardAction(authCardEvent('om_auth_1', authId, 'approve', 'once', 'ou_owner'));
+    await bridge.waitForIdle();
+
+    const st = JSON.parse(await (await import('node:fs/promises')).readFile(stFile, 'utf8'));
+    assert.equal(st.status, 'approved');
+    assert.equal(st.grant, 'once');
+    assert.equal(st.operator, 'ou_owner');
+    assert.ok(st.decision_at);
+    assert.equal(patches.length, 1, 'the auth card should be patched to its resolved state');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('an authorization card button denies a pending request', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-im-auth-'));
+  try {
+    const authId = 'auth-test-deny';
+    const stFile = join(dir, `${authId}.json`);
+    await writeFile(stFile, JSON.stringify({
+      id: authId,
+      status: 'pending',
+      desc: 'deny me',
+      risk: 'high',
+      cmd: 'bash',
+      choices: ['once', 'deny'],
+      created_at: '2026-08-25T00:00:00.000000',
+      decision_at: null,
+      operator: null,
+      grant: null,
+    }));
+
+    const fixture = stateFixture();
+    const bridge = new FeishuHarnessBridge({
+      client: cardClient(async () => undefined),
+      channel: {},
+      harness: sessionsHarness(1),
+      state: fixture.state,
+      status: bridgeStatus(),
+      allowedSenderOpenIds: new Set(['ou_owner']),
+      authDir: dir,
+    });
+
+    await bridge.onCardAction(authCardEvent('om_auth_2', authId, 'deny', 'deny', 'ou_owner'));
+    await bridge.waitForIdle();
+
+    const st = JSON.parse(await (await import('node:fs/promises')).readFile(stFile, 'utf8'));
+    assert.equal(st.status, 'denied');
+    assert.equal(st.grant, 'deny');
+    assert.equal(st.operator, 'ou_owner');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('an authorization card button from a non-owner is ignored', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-im-auth-'));
+  try {
+    const authId = 'auth-test-evil';
+    const stFile = join(dir, `${authId}.json`);
+    await writeFile(stFile, JSON.stringify({
+      id: authId,
+      status: 'pending',
+      desc: 'do not touch',
+      risk: 'medium',
+      cmd: 'bash',
+      choices: ['once', 'deny'],
+      created_at: '2026-08-25T00:00:00.000000',
+      decision_at: null,
+      operator: null,
+      grant: null,
+    }));
+
+    const fixture = stateFixture();
+    const bridge = new FeishuHarnessBridge({
+      client: cardClient(async () => undefined),
+      channel: {},
+      harness: sessionsHarness(1),
+      state: fixture.state,
+      status: bridgeStatus(),
+      allowedSenderOpenIds: new Set(['ou_owner']),
+      authDir: dir,
+    });
+
+    await bridge.onCardAction(authCardEvent('om_auth_3', authId, 'approve', 'once', 'ou_evil'));
+    await bridge.waitForIdle();
+
+    const st = JSON.parse(await (await import('node:fs/promises')).readFile(stFile, 'utf8'));
+    assert.equal(st.status, 'pending', 'non-owner must not mutate the auth state');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('an authorization card button for an unknown auth id is ignored without error', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-im-auth-'));
+  try {
+    const fixture = stateFixture();
+    const bridge = new FeishuHarnessBridge({
+      client: cardClient(async () => undefined),
+      channel: {},
+      harness: sessionsHarness(1),
+      state: fixture.state,
+      status: bridgeStatus(),
+      allowedSenderOpenIds: new Set(['ou_owner']),
+      authDir: dir,
+    });
+
+    await bridge.onCardAction(authCardEvent('om_auth_4', 'auth-does-not-exist', 'approve', 'once', 'ou_owner'));
+    await bridge.waitForIdle();
+    // No state file should have been created and no exception should escape.
+    const entries = await (await import('node:fs/promises')).readdir(dir);
+    assert.equal(entries.length, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('an authorization card is ignored when authDir is not configured', async () => {
+  const fixture = stateFixture();
+  const bridge = new FeishuHarnessBridge({
+    client: cardClient(async () => undefined),
+    channel: {},
+    harness: sessionsHarness(1),
+    state: fixture.state,
+    status: bridgeStatus(),
+    allowedSenderOpenIds: new Set(['ou_owner']),
+  });
+  // authId present but authDir undefined: no crash, no writes attempted.
+  await bridge.onCardAction(authCardEvent('om_auth_5', 'auth-any', 'approve', 'once', 'ou_owner'));
+  await bridge.waitForIdle();
+});

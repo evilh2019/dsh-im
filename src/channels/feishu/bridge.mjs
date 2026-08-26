@@ -1,4 +1,6 @@
 import QRCode from 'qrcode';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 import {
   conversationKey,
   extractInboundMessage,
@@ -196,6 +198,14 @@ function callbackObject(value) {
   } catch {
     return {};
   }
+}
+
+/** Best-effort chat id extraction from a card.action.trigger event. */
+function chatIdFromEvent(event) {
+  return nonEmptyString(event?.context?.open_chat_id)
+    ?? nonEmptyString(event?.open_chat_id)
+    ?? nonEmptyString(event?.chat_id)
+    ?? '';
 }
 
 /** Normalize a single-select value without corrupting valid commas in an id/path. */
@@ -420,6 +430,7 @@ export class FeishuHarnessBridge {
   #botOpenId;
   #groupResponseMode;
   #repair;
+  #authDir = null;
   #repairAttempt = null;
   #repairMonitorVersion = 0;
   #repairPollIntervalMs;
@@ -456,6 +467,7 @@ export class FeishuHarnessBridge {
     repairLinkWaitMs = REPAIR_LINK_WAIT_MS,
     cardDataTimeoutMs = CARD_DATA_TIMEOUT_MS,
     replyTimeoutMs = 600_000,
+    authDir = null,
     logger = console,
     signal,
   }) {
@@ -492,6 +504,7 @@ export class FeishuHarnessBridge {
     this.#repairLinkWaitMs = repairLinkWaitMs;
     this.#cardDataTimeoutMs = cardDataTimeoutMs;
     this.#replyTimeoutMs = replyTimeoutMs;
+    this.#authDir = nonEmptyString(authDir) ? authDir : null;
     this.#logger = logger;
     this.#approvals = new HarnessApprovalQueue({ label: 'Feishu', logger });
     this.#signal = signal;
@@ -1477,10 +1490,20 @@ export class FeishuHarnessBridge {
       return Promise.resolve();
     }
     const actionValue = callbackObject(event?.action?.value);
-    const formValue = callbackObject(event?.action?.form_value);
     const action = nonEmptyString(actionValue.action)
       ?? nonEmptyString(event?.action?.action);
-    if (!action) return Promise.resolve();
+    if (!action) {
+      if (this.#authDir && nonEmptyString(actionValue.auth_id)) {
+        return this.#handleAuthCardAction({
+          authId: actionValue.auth_id,
+          decision: nonEmptyString(actionValue.decision),
+          grant: nonEmptyString(actionValue.grant) ?? 'once',
+          operatorOpenId,
+          event,
+        });
+      }
+      return Promise.resolve();
+    }
     // select_static dropdown: resolve pickers to their target actions
     const option = callbackSingleOption(event?.action?.option)
       ?? (action.endsWith('_pick') ? callbackMultiOptionValues(event?.action?.options)[0] : null);
@@ -1582,6 +1605,81 @@ export class FeishuHarnessBridge {
       eventId,
       operatorOpenId,
     });
+  }
+
+  /**
+   * Authorization-card callback (auth_request.py). The card buttons carry
+   * `{ auth_id, decision: 'approve'|'deny', grant }` with no `action` field.
+   * Resolves the pending state file under `authDir` and patches the card to
+   * its resolved state so the operator sees the outcome.
+   */
+  async #handleAuthCardAction({ authId, decision, grant, operatorOpenId, event }) {
+    if (decision !== 'approve' && decision !== 'deny') {
+      this.#logger.warn?.('[dsh-feishu] auth card with unknown decision', decision);
+      return;
+    }
+    const messageId = nonEmptyString(event?.context?.open_message_id)
+      ?? nonEmptyString(event?.open_message_id)
+      ?? nonEmptyString(event?.message_id);
+    const statePath = resolve(this.#authDir, `${authId}.json`);
+    try {
+      await mkdir(this.#authDir, { recursive: true });
+      let state;
+      try {
+        state = JSON.parse(await readFile(statePath, 'utf8'));
+      } catch {
+        this.#logger.warn?.('[dsh-feishu] auth card for unknown/expired auth_id', authId);
+        return;
+      }
+      if (state.status !== 'pending') {
+        this.#logger.info?.('[dsh-feishu] auth card duplicate/expired auth_id', authId, state.status);
+        return;
+      }
+      const approved = decision === 'approve';
+      const next = {
+        ...state,
+        status: approved ? 'approved' : 'denied',
+        grant: approved ? grant : 'deny',
+        decision_at: new Date().toISOString(),
+        operator: operatorOpenId ?? null,
+      };
+      await writeFile(statePath, JSON.stringify(next, null, 2), 'utf8');
+      this.#logger.info?.(`[dsh-feishu] auth decision auth_id=${authId} -> ${next.status} grant=${next.grant}`);
+      // Patch the card to its resolved state (best-effort; the state file is
+      // authoritative for auth_request.py's polling).
+      if (messageId) {
+        try {
+          const resultText = approved
+            ? `✅ 已授权　${state.desc ?? ''}`
+            : `❌ 已拒绝　${state.desc ?? ''}`;
+          // message.patch requires content to be a JSON string, not an object.
+          const cardJson = JSON.stringify({
+            schema: '2.0',
+            header: {
+              title: { tag: 'plain_text', content: '🔐 授权请求' },
+              template: approved ? 'green' : 'red',
+            },
+            body: {
+              elements: [
+                { tag: 'markdown', content: `**结果**：${resultText}\n已处理：${next.decision_at}` },
+              ],
+            },
+          });
+          const response = await this.#client.im.v1.message.patch({
+            path: { message_id: messageId },
+            data: { content: cardJson },
+          });
+          if (response?.code && response.code !== 0) {
+            throw new Error(`Feishu card update failed: ${response.msg || response.code}`);
+          }
+          this.#rememberCardRoute(messageId, chatIdFromEvent(event), {});
+        } catch (error) {
+          this.#logger.warn?.('[dsh-feishu] auth card patch failed:', error?.code ?? error?.message ?? error);
+        }
+      }
+    } catch (error) {
+      this.#logger.warn?.('[dsh-feishu] auth card handling failed:', error?.code ?? error?.message ?? error);
+    }
   }
 
   #pruneCompletedCardActions(now = Date.now()) {

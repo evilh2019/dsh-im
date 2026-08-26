@@ -118,6 +118,7 @@ export class FeishuRuntime {
   #abortController = null;
   #pendingCardActionProbes = new Map();
   #status;
+  #authDir = null;
 
   constructor({
     lark,
@@ -136,6 +137,7 @@ export class FeishuRuntime {
     connectTimeoutMs = 15000,
     requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
     wsAgent,
+    authDir = null,
     logger = console,
   }) {
     if (!lark) throw new Error('FeishuRuntime requires the Feishu SDK');
@@ -167,6 +169,7 @@ export class FeishuRuntime {
     this.#connectTimeoutMs = connectTimeoutMs;
     this.#requestTimeoutMs = requestTimeoutMs;
     this.#wsAgent = wsAgent;
+    this.#authDir = nonEmptyString(authDir) ? authDir : null;
     this.#logger = logger;
     this.#status = createBridgeStatus({ allowedSenderCount: normalizedOwners.length });
   }
@@ -243,6 +246,13 @@ export class FeishuRuntime {
         appId: this.#appId,
         appSecret: this.#appSecret,
         domain: sdkDomain,
+        // Channel-protocol signaling tag: without it the Feishu server only
+        // delivers P2P DM events over the WebSocket transport (receive_v1
+        // works), but NOT card.action.trigger callbacks. The tag tells the
+        // server to use the Channel protocol, which enables callback/group
+        // event delivery. Mirrors lark_oapi's FeishuChannel default
+        // (extra_ua_tags=["channel"]) and node-sdk's own LarkChannel.
+        extraUaTags: ['channel'],
       };
       const httpInstance = httpInstanceWithTimeout(
         this.#lark.defaultHttpInstance,
@@ -268,6 +278,7 @@ export class FeishuRuntime {
         groupResponseMode: this.#groupResponseMode,
         repair: this.#repair,
         replyTimeoutMs: this.#replyTimeoutMs,
+        authDir: this.#authDir,
         signal,
         logger: this.#logger,
       });
@@ -283,7 +294,17 @@ export class FeishuRuntime {
         // subscribes card.action.trigger; the number-reply fallback covers
         // apps that do not).
         'card.action.trigger': (event) => {
-          if (!isCurrentStart()) return;
+          const alive = isCurrentStart();
+          console.warn('[dsh-feishu] RAW card.action.trigger alive=' + alive + ' typeof=' + typeof event
+            + ' keys=' + JSON.stringify(event && typeof event === 'object' ? Object.keys(event).slice(0, 10) : null));
+          try {
+            const preview = event && typeof event === 'object'
+              ? { action: event.action, actionValue: event.actionValue, operator: event.operator, context: event.context }
+              : String(event);
+            this.#logger.warn('[dsh-feishu] card.action.trigger handler invoked, isCurrentStart=' + alive
+              + ' event=' + JSON.stringify(preview));
+          } catch (e) { console.warn('[dsh-feishu] logger FAILED: ' + e.message); }
+          if (!alive) { console.warn('[dsh-feishu] returning early, !alive'); return; }
           this.#status.cardActionsReceived += 1;
           this.#status.lastCardActionAt = new Date().toISOString();
           if (!this.#consumeCardActionProbe(event)) void bridge.onCardAction(event);
