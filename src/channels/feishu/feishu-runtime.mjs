@@ -133,6 +133,7 @@ export class FeishuRuntime {
   #stopping = null;
   #abortController = null;
   #pendingCardActionProbes = new Map();
+  #authDir = null;
   #status;
   #slashCommands = true;
 
@@ -155,6 +156,7 @@ export class FeishuRuntime {
     contextEnhancement,
     accessPolicy,
     repair,
+    authDir = null,
     replyTimeoutMs = 600000,
     connectTimeoutMs = 15000,
     requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
@@ -178,6 +180,7 @@ export class FeishuRuntime {
 
     this.#lark = lark;
     this.#botId = nonEmptyString(botId);
+    this.#authDir = nonEmptyString(authDir) ? authDir : null;
     this.#appId = appId;
     this.#appSecret = appSecret;
     this.#domain = domain;
@@ -321,6 +324,7 @@ export class FeishuRuntime {
         stepPushMode: this.#stepPushMode,
         sessionSyncTargetsFor: this.#sessionSyncTargetsFor,
         repair: this.#repair,
+        authDir: this.#authDir,
         replyTimeoutMs: this.#replyTimeoutMs,
         // Interaction cards (approval/question buttons) are on by default.
         // Set DSH_IM_INTERACTION_CARDS=0 to fall back to plain-text replies.
