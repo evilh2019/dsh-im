@@ -220,12 +220,7 @@ export class VerifiedFeishuChannel {
       activeCard = await this.#createStreamCard(chatId, options);
       cards.push(activeCard);
       let lastContent = this.#initialText;
-      let lastContentIsTransient = true;
-      // Track the current card separately from incoming snapshots: held or
-      // failed writes have not delivered any text that can be deduplicated.
-      let activeView = lastContent;
-      let activeTextPrefix = null;
-      // issue #86：独立交互消息（提问/审批）落在占位卡下方后，最终答案不得
+// issue #86：独立交互消息（提问/审批）落在占位卡下方后，最终答案不得
       // 回写旧卡。rotate() 把旧卡定格为「过程记录 + 指引行」并标记换卡态；
       // 下一次 setContent（过程更新或最终答案）才创建新卡——新卡必然创建于
       // 交互消息之后。旧卡纳入 cards，参与 recall 与 providerMessageIds。
@@ -241,24 +236,7 @@ export class VerifiedFeishuChannel {
         rotating = false;
         return activeCard;
       };
-      // issue #163：冻结前缀去重——换卡定格时旧卡已展示 frozenContent；此后
-      // 新卡只展示剥离该前缀后的增量（重放快照剥为空白则跳过写卡），终稿
-      // 分段同样使用增量视图，提问前的过程不再重复播放。
-      let frozenContent = null;
-      const applyFrozenDedup = (next) => {
-        if (frozenContent === null || !next.startsWith(frozenContent)) return next;
-        const rest = next.slice(frozenContent.length);
-        return rest.trim().length > 0 ? rest : ''; // 不改写增量原文；全空白视为无增量
-      };
-      // 评审补充（#163）：去重基线与定格内容必须以「旧卡实际展示的内容」为准——
-      // 超长快照的旧卡只展示了截断前缀，若冻结完整 lastContent，未展示的尾部
-      // 会被整段剥掉而丢失；再次换卡时旧卡展示的是上一轮增量，不得回写完整快照。
-      const shownPrefixOf = (text) => {
-        const notice = `\n\n${t('内容较长，生成完成后将分段发送完整回答。')}`;
-        return text.length <= MAX_STREAM_CHARS
-          ? text
-          : streamTextPrefix(text, MAX_STREAM_CHARS - notice.length);
-      };
+      let _sendPromise = null;
       const controller = {
         get messageId() {
           return activeCard.messageId;
@@ -284,43 +262,44 @@ export class VerifiedFeishuChannel {
             // 明确降级：定格失败不阻塞交互呈现，旧卡保留原内容。
             console.warn('[dsh-feishu] unable to finalize the superseded stream card:', error.message);
           }
-        }),
-        setContent: (content, { transient = false } = {}) => enqueue(async () => {
+        },
+        setContent: async (content) => {
+          // Ensure the card is sent before any content update.
+          if (!activeCard.messageId && !_sendPromise) {
+            _sendPromise = this.#sendCard(activeCard.chatId, activeCard.cardId, activeCard.replyTo);
+            activeCard.messageId = await _sendPromise;
+          }
           const next = String(content ?? '') || '…';
           // Retain the latest snapshot even if it is a replay or a held write.
           lastContent = next;
-          lastContentIsTransient = transient;
-          const visible = transient ? next : applyFrozenDedup(next);
-          if (visible === '') return; // 重放快照不建卡不写卡
-          if (awaitingPresentation) return; // 换卡挂起：视图已推进，仅挂起卡片写入
-          const card = await ensureActiveCard();
-          await this.#updateStreamCard(card, streamPreview(visible));
-          activeView = visible;
-          const previousPrefix = frozenContent !== null && next.startsWith(frozenContent)
-            ? frozenContent
-            : '';
-          activeTextPrefix = transient ? null : previousPrefix + shownPrefixOf(visible);
-        }),
+        },
+        send: async () => {
+          if (!activeCard.messageId && !_sendPromise) {
+            _sendPromise = this.#sendCard(activeCard.chatId, activeCard.cardId, activeCard.replyTo);
+            activeCard.messageId = await _sendPromise;
+          }
+        },
       };
 
       await input.markdown(controller);
-      await enqueue(async () => {
-        // 终稿强制解除挂起：异常路径下呈现通知缺失时仍可收尾。
-        awaitingPresentation = false;
-        // Recompute from the final snapshot, including an empty delta, rather
-        // than retaining the last nonempty progress/tool view as the answer.
-        const finalView = (lastContentIsTransient ? lastContent : applyFrozenDedup(lastContent))
-          || lastContent;
-        const chunks = splitStreamContent(finalView);
-        for (const [index, chunk] of chunks.entries()) {
-          const card = index === 0
-            ? await ensureActiveCard()
-            : await this.#createStreamCard(chatId, options);
-          if (index > 0) cards.push(card);
-          await this.#updateStreamCard(card, chunk);
-          await this.#finishStreamCard(card);
+      // Ensure the first card is sent. If controller.send() was called
+      // but is still in-flight, wait for it; otherwise send now.
+      if (_sendPromise) await _sendPromise;
+      else if (!activeCard.messageId) {
+        activeCard.messageId = await this.#sendCard(activeCard.chatId, activeCard.cardId, activeCard.replyTo);
+      }
+      const chunks = splitStreamContent(lastContent);
+      for (const [index, chunk] of chunks.entries()) {
+        const card = index === 0
+          ? await ensureActiveCard()
+: await this.#createStreamCard(chatId, options.replyTo);
+        if (index > 0) {
+          cards.push(card);
+          card.messageId = await this.#sendCard(card.chatId, card.cardId, card.replyTo);
         }
-      });
+        await this.#updateStreamCard(card, chunk);
+        await this.#finishStreamCard(card);
+      }
       return {
         messageId: cards[0].messageId,
         providerMessageIds: cards.map((card) => card.messageId),
@@ -506,8 +485,9 @@ export class VerifiedFeishuChannel {
     }));
     const cardId = response?.data?.card_id;
     if (!cardId) throw new Error('Feishu card.create returned no card_id');
-    const messageId = await this.#sendCard(chatId, cardId, options);
-    return { cardId, messageId, content, sequence: 0 };
+// Delay sending: the card is created but not sent as a message until
+    // setContent has actual content, so approval cards appear first.
+    return { cardId, messageId: null, chatId, replyTo, content, sequence: 0 };
   }
 
   async #updateStreamCard(card, content) {
