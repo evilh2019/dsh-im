@@ -211,7 +211,7 @@ export class VerifiedFeishuChannel {
       activeCard = await this.#createStreamCard(chatId, options.replyTo);
       cards.push(activeCard);
       let lastContent = this.#initialText;
-      // issue #86：独立交互消息（提问/审批）落在占位卡下方后，最终答案不得
+// issue #86：独立交互消息（提问/审批）落在占位卡下方后，最终答案不得
       // 回写旧卡。rotate() 把旧卡定格为「过程记录 + 指引行」并标记换卡态；
       // 下一次 setContent（过程更新或最终答案）才创建新卡——新卡必然创建于
       // 交互消息之后。旧卡纳入 cards，参与 recall 与 providerMessageIds。
@@ -222,6 +222,7 @@ export class VerifiedFeishuChannel {
         rotating = false;
         return activeCard;
       };
+      let _sendPromise = null;
       const controller = {
         get messageId() {
           return activeCard.messageId;
@@ -241,6 +242,11 @@ export class VerifiedFeishuChannel {
           }
         },
         setContent: async (content) => {
+          // Ensure the card is sent before any content update.
+          if (!activeCard.messageId && !_sendPromise) {
+            _sendPromise = this.#sendCard(activeCard.chatId, activeCard.cardId, activeCard.replyTo);
+            activeCard.messageId = await _sendPromise;
+          }
           const next = String(content ?? '') || '…';
           const card = await ensureActiveCard();
           await this.#updateStreamCard(card, streamPreview(next));
@@ -248,15 +254,30 @@ export class VerifiedFeishuChannel {
           // Retain the full latest snapshot even when its preview is unchanged.
           lastContent = next;
         },
+        send: async () => {
+          if (!activeCard.messageId && !_sendPromise) {
+            _sendPromise = this.#sendCard(activeCard.chatId, activeCard.cardId, activeCard.replyTo);
+            activeCard.messageId = await _sendPromise;
+          }
+        },
       };
 
       await input.markdown(controller);
+      // Ensure the first card is sent. If controller.send() was called
+      // but is still in-flight, wait for it; otherwise send now.
+      if (_sendPromise) await _sendPromise;
+      else if (!activeCard.messageId) {
+        activeCard.messageId = await this.#sendCard(activeCard.chatId, activeCard.cardId, activeCard.replyTo);
+      }
       const chunks = splitStreamContent(lastContent);
       for (const [index, chunk] of chunks.entries()) {
         const card = index === 0
           ? await ensureActiveCard()
           : await this.#createStreamCard(chatId, options.replyTo);
-        if (index > 0) cards.push(card);
+        if (index > 0) {
+          cards.push(card);
+          card.messageId = await this.#sendCard(card.chatId, card.cardId, card.replyTo);
+        }
         await this.#updateStreamCard(card, chunk);
         await this.#finishStreamCard(card);
       }
@@ -420,8 +441,9 @@ export class VerifiedFeishuChannel {
     }));
     const cardId = response?.data?.card_id;
     if (!cardId) throw new Error('Feishu card.create returned no card_id');
-    const messageId = await this.#sendCard(chatId, cardId, replyTo);
-    return { cardId, messageId, content, sequence: 0 };
+    // Delay sending: the card is created but not sent as a message until
+    // setContent has actual content, so approval cards appear first.
+    return { cardId, messageId: null, chatId, replyTo, content, sequence: 0 };
   }
 
   async #updateStreamCard(card, content) {

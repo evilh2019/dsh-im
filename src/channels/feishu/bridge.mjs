@@ -462,6 +462,7 @@ export class FeishuHarnessBridge {
   #menus = new Map();
   /** Interactive-card message id → route context for button callbacks. */
   #cardKeys = new Map();
+  #approvalCardMessages = new Map();
   /** The global event-mux watcher (one per bridge). */
   #eventWatcher = null;
   /** Serializes completion work per session without blocking unrelated sessions. */
@@ -1714,6 +1715,20 @@ export class FeishuHarnessBridge {
           return;
         }
       }
+      // Approval card buttons: approve / reject
+      if (action === 'approval_approve' || action === 'approval_reject') {
+        const approvalId = nonEmptyString(actionValue.approval_id);
+        if (approvalId) {
+          await this.#handleApprovalCardAction({
+            approvalId,
+            decision: actionValue.decision,
+            grant: nonEmptyString(actionValue.grant) ?? 'once',
+            messageId: entry.messageId,
+            operatorOpenId,
+          });
+          return;
+        }
+      }
       await this.#handleCardAction(resolvedAction, entry);
     }, {
       lane: isStop || isRealSteer ? 'control' : 'regular',
@@ -2345,6 +2360,245 @@ export class FeishuHarnessBridge {
       }
     } catch (error) {
       this.#logger.warn?.('[dsh-feishu] auth card handling failed:', error?.code ?? error?.message ?? error);
+    }
+  }
+
+  /**
+   * Harness approval card — sends an interactive card with approve/reject
+   * buttons instead of the text-based approval flow. The card callback
+   * resolves the approval and patches the card to show the result.
+   *
+   * 对齐 auth_request.py Card 1.0 方案，按钮按风险等级：
+   *   - 高风险（danger-full-access）→ [✅ 本次, ❌ 拒绝] + smartDenied 警告
+   *   - 中风险（workspace-write / bash）→ [✅ 本次, 🔁 本会话, ❌ 拒绝]
+   *   - 低风险（其他工具）→ [✅ 本次, 🔁 本会话, ⚡ 始终允许, ❌ 拒绝]
+   */
+  async #handleApprovalCard(interaction, { key, actor, chatId, requiresMention }) {
+    const payload = interaction.payload;
+    const approvalId = typeof payload?.approvalId === 'string' ? payload.approvalId.trim() : '';
+    if (!approvalId
+      || !interaction.rpcId
+      || !interaction.sessionId
+      || typeof interaction.respond !== 'function') {
+      this.#logger.warn?.('[dsh-feishu] ignored an invalid approval interaction');
+      return;
+    }
+
+    if (interaction.recovered === true) {
+      try {
+        await interaction.respond({
+          ok: true,
+          value: { sessionId: interaction.sessionId, approvalId, outcome: 'rejected' },
+        }, { signal: AbortSignal.timeout(5_000) });
+      } catch { /* ignore */ }
+      return;
+    }
+
+    const toolName = typeof payload?.toolName === 'string' ? payload.toolName.trim() : '';
+    const toolCall = interaction.toolCall;
+    let operation = '';
+    const source = toolCall?.arguments;
+    if (source !== null && typeof source === 'object') {
+      try { operation = JSON.stringify(source, null, 2); } catch { operation = ''; }
+    } else if (typeof source === 'string') {
+      operation = source.trim();
+      if (operation) {
+        try { operation = JSON.stringify(JSON.parse(operation), null, 2); } catch { /* keep raw */ }
+      }
+    }
+    const reason = typeof payload?.reason === 'string' ? payload.reason.trim() : '';
+
+    // 风险等级判定：对齐 auth_request.py 的 high/medium/low 策略
+    const isDangerFullAccess = reason.includes('danger-full-access');
+    const isWorkspaceWrite = reason.includes('workspace-write');
+    const isBash = toolName === 'bash';
+    const isHighRisk = isDangerFullAccess;
+    const isMediumRisk = isWorkspaceWrite || isBash;
+    const risk = isHighRisk ? 'high' : isMediumRisk ? 'medium' : 'low';
+
+    const riskColor = { high: 'red', medium: 'orange', low: 'blue' }[risk];
+    const riskLabel = { high: '🔴 高风险', medium: '🟠 中风险', low: '🔵 低风险' }[risk];
+
+    const bodyElements = [];
+    bodyElements.push({ tag: 'markdown', content: `**工具**：${toolName || '（未知）'}　${riskLabel}` });
+    if (operation) {
+      bodyElements.push({ tag: 'markdown', content: `**操作参数**：\n\`\`\`\n${operation.slice(0, 5000)}\n\`\`\`` });
+    }
+    if (reason) {
+      bodyElements.push({ tag: 'markdown', content: `**原因**：${reason.slice(0, 1000)}` });
+    }
+
+    // 构建按钮：对齐 auth_request.py 的 choices 策略
+    const buttons = [];
+    // ✅ 本次 — 始终可用
+    buttons.push({
+      tag: 'button', text: { tag: 'plain_text', content: '✅ 本次' },
+      type: 'primary',
+      value: { action: 'approval_approve', approval_id: approvalId, decision: 'allowed-once', grant: 'once' },
+    });
+    // 🔁 本会话 — 中/低风险可用
+    if (!isHighRisk) {
+      buttons.push({
+        tag: 'button', text: { tag: 'plain_text', content: '🔁 本会话' },
+        type: 'default',
+        value: { action: 'approval_approve', approval_id: approvalId, decision: 'allowed-once', grant: 'session' },
+      });
+    }
+    // ⚡ 始终允许 — 仅低风险可用（非 bash 的普通工具）
+    if (!isHighRisk && !isMediumRisk) {
+      buttons.push({
+        tag: 'button', text: { tag: 'plain_text', content: '⚡ 始终允许' },
+        type: 'default',
+        confirm: {
+          title: { tag: 'plain_text', content: '始终允许此操作？' },
+          text: { tag: 'plain_text', content: `将把「${toolName || '此工具'}」加入永久允许列表，当前和未来会话对同类操作不再询问。\n${reason.slice(0, 60)}` },
+        },
+        value: { action: 'approval_approve', approval_id: approvalId, decision: 'allowed-once', grant: 'always' },
+      });
+    }
+    // ❌ 拒绝 — 始终可用
+    buttons.push({
+      tag: 'button', text: { tag: 'plain_text', content: '❌ 拒绝' },
+      type: 'danger',
+      value: { action: 'approval_reject', approval_id: approvalId, decision: 'rejected', grant: 'deny' },
+    });
+
+    const timeout = 300; // 5 分钟，与 Harness 默认审批超时一致
+    const expireTs = new Date(Date.now() + timeout * 1000)
+      .toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+
+    const approvalElements = [
+      ...bodyElements,
+      {
+        tag: 'markdown',
+        content: `⏱️ 有效期 **${timeout} 秒**（截止 ${expireTs}），超时自动失效`,
+      },
+    ];
+    if (isHighRisk) {
+      approvalElements.push({
+        tag: 'markdown',
+        content: '⚠️ 此操作被安全策略标记为**高风险**，仅允许单次授权或拒绝',
+      });
+    }
+    approvalElements.push({ tag: 'hr' });
+    approvalElements.push({ tag: 'action', actions: buttons });
+
+    const cardJson = JSON.stringify({
+      config: { wide_screen_mode: true },
+      header: {
+        title: { tag: 'plain_text', content: '🔐 工具审批' },
+        template: riskColor,
+      },
+      elements: approvalElements,
+    });
+
+    let messageId;
+    try {
+      messageId = await this.#sendCard(chatId, cardJson, { key });
+    } catch (error) {
+      this.#logger.warn?.('[dsh-feishu] failed to send approval card:', error?.code ?? error?.message ?? error);
+      // Fall back to text-based approval
+      return this.#approvals.handleRequested(interaction, {
+        key, actor, requiresMention,
+        send: (text) => this.#send(chatId, text),
+      });
+    }
+
+    // Store the mapping so the card callback can find the pending approval.
+    this.#approvalCardMessages.set(messageId, { approvalId, interaction, chatId, key });
+
+    // Register with the queue for lifecycle management (route ordering, etc.)
+    await this.#approvals.handleRequested(interaction, {
+      key, actor, requiresMention,
+      send: (text) => this.#send(chatId, text),
+      present: async () => {
+        // Card was already sent above — no-op.
+      },
+      notify: async (_pending, outcome) => {
+        // If the card is still in the map, the user didn't click a button
+        // (timeout / closeRoute). Otherwise already handled by the callback.
+        const entry = this.#approvalCardMessages.get(messageId);
+        if (entry) {
+          this.#approvalCardMessages.delete(messageId);
+          await this.#patchApprovalCard(messageId, 'timeout');
+        }
+      },
+    });
+  }
+
+  /**
+   * Card callback for approval buttons. Calls interaction.respond() to
+   * resolve the approval, then patches the card and cleans up the queue.
+   *
+   * grant scopes:
+   *   - once     → allowed-once (单次)
+   *   - session  → allowed-once + approval/grant(session) （本会话）
+   *   - always   → allowed-once + approval/grant(always)  （始终允许）
+   */
+  async #handleApprovalCardAction({ approvalId, decision, grant, messageId, operatorOpenId }) {
+    const entry = this.#approvalCardMessages.get(messageId);
+    if (!entry) return;
+    this.#approvalCardMessages.delete(messageId);
+
+    const outcome = decision === 'rejected' ? 'rejected' : 'allowed-once';
+    try {
+      await entry.interaction.respond({
+        ok: true,
+        value: { sessionId: entry.interaction.sessionId, approvalId, outcome, grant },
+      }, { signal: AbortSignal.timeout(5_000) });
+    } catch (error) {
+      this.#logger.warn?.('[dsh-feishu] approval card respond failed:', error?.code ?? error?.message ?? error);
+    }
+
+    // Patch the card to show the result.
+    const resultGrant = outcome === 'allowed-once' ? (grant ?? 'once') : 'deny';
+    await this.#patchApprovalCard(messageId, outcome, resultGrant);
+
+    // Clean up the queue — the card callback already responded, so
+    // resolveByCard just removes the pending item and promotes the next.
+    this.#approvals.resolveByCard(approvalId, outcome);
+  }
+
+  async #patchApprovalCard(messageId, outcome, grant = 'once') {
+    if (!messageId) return;
+    const resultLabel = outcome === 'allowed-once'
+      ? (grant === 'always' ? '✅ 已批准（始终允许）' : grant === 'session' ? '✅ 已批准（本会话有效）' : '✅ 已批准，仅对本次操作有效。')
+      : outcome === 'timeout'
+        ? '⏰ 已过期，超时未处理。'
+        : outcome === 'rejected'
+          ? '❌ 已拒绝此次操作。'
+          : '该审批已处理。';
+    const template = outcome === 'allowed-once' ? 'green' : outcome === 'timeout' ? 'grey' : outcome === 'rejected' ? 'red' : 'blue';
+
+    // 对齐 auth_request.py：patch 结果卡保留 disabled 按钮，视觉上表达"已处理"
+    const disabledButtons = [
+      { tag: 'button', text: { tag: 'plain_text', content: '✅ 本次' }, type: 'primary', disabled: true, disabled_tips: { tag: 'plain_text', content: '审批已处理，无需重复操作' } },
+    ];
+    if (grant !== 'once' || outcome === 'rejected') {
+      disabledButtons.push({ tag: 'button', text: { tag: 'plain_text', content: '🔁 本会话' }, type: 'default', disabled: true, disabled_tips: { tag: 'plain_text', content: '审批已处理，无需重复操作' } });
+      disabledButtons.push({ tag: 'button', text: { tag: 'plain_text', content: '⚡ 始终允许' }, type: 'default', disabled: true, disabled_tips: { tag: 'plain_text', content: '审批已处理，无需重复操作' } });
+    }
+    disabledButtons.push({ tag: 'button', text: { tag: 'plain_text', content: '❌ 拒绝' }, type: 'danger', disabled: true, disabled_tips: { tag: 'plain_text', content: '审批已处理，无需重复操作' } });
+
+    const cardJson = JSON.stringify({
+      config: { wide_screen_mode: true },
+      header: {
+        title: { tag: 'plain_text', content: '🔐 审批结果' },
+        template,
+      },
+      elements: [
+        { tag: 'markdown', content: `**结果**：${resultLabel}` },
+        { tag: 'hr' },
+        { tag: 'action', actions: disabledButtons },
+      ],
+    });
+    try {
+      await this.#client.im.v1.message.patch({
+        path: { message_id: messageId },
+        data: { content: cardJson },
+      });
+    } catch (error) {
+      this.#logger.warn?.('[dsh-feishu] approval card patch failed:', error?.code ?? error?.message ?? error);
     }
   }
 
@@ -3453,21 +3707,63 @@ export class FeishuHarnessBridge {
       stream = await this.#channel.stream(chatId, {
         markdown: async (controller) => {
           promptStarted = true;
-          const baseAskOptions = this.#interactionAskOptions(event, key, message.files);
+let streamSent = false;
+          let approvalPending = false;
+          let approvalResolved = false;
+          let bufferedContent = null;
+          const sendStream = async () => {
+            if (!streamSent) {
+              streamSent = true;
+              if (typeof controller.send === 'function') await controller.send();
+            }
+          };
+          // Flush the buffered card. Always flushes regardless of approval state.
+          const flushStream = async () => {
+            if (streamSent) return;
+            if (bufferedContent) {
+              await controller.setContent(bufferedContent);
+              bufferedContent = null;
+            }
+            await sendStream();
+          };
+          const baseOptions = this.#interactionAskOptions(event, key, message.files);
           const askOptions = {
-            ...baseAskOptions,
+            ...baseOptions,
+            onUpdate: async (update) => {
+              const text = this.#progressText(update);
+              this.#status.streamUpdates = (this.#status.streamUpdates ?? 0) + 1;
+              if (!streamSent) {
+                bufferedContent = text;
+                console.warn('[dsh-feishu] buffering card, waiting for onInteraction');
+              } else {
+                await controller.setContent(text);
+              }
+            },
             // issue #86：独立交互消息（提问/审批）会落在占位卡下方，呈现前
             // 先换卡，让最终答案落在交互消息之后的新流式卡上。
             onInteraction: async (interaction) => {
+              console.warn('[dsh-feishu] onInteraction received:', interaction?.kind);
               if ((interaction?.kind === 'question' || interaction?.kind === 'approval')
                 && typeof controller?.rotate === 'function') {
                 await controller.rotate();
               }
-              await baseAskOptions.onInteraction(interaction);
+              if (interaction?.kind === 'approval') {
+                approvalPending = true;
+              }
+              // Let the interaction text be sent first, then flush the card
+              await baseOptions.onInteraction(interaction);
+              console.warn('[dsh-feishu] interaction text sent — flushing card');
+              flushStream().catch(() => {});
             },
-            onUpdate: async (update) => {
-              await controller.setContent(this.#progressText(update));
-              this.#status.streamUpdates = (this.#status.streamUpdates ?? 0) + 1;
+            onInteractionResolved: (resolution) => {
+              console.warn('[dsh-feishu] onInteractionResolved:', resolution?.kind);
+              if (resolution?.kind === 'approval') {
+                approvalPending = false;
+                approvalResolved = true;
+              }
+              console.warn('[dsh-feishu] interaction resolved — flushing card');
+              flushStream().catch(() => {});
+              return baseOptions.onInteractionResolved(resolution);
             },
           };
           const completed = await askInWorkspaceSession({
@@ -3483,6 +3779,8 @@ export class FeishuHarnessBridge {
           markAskComplete();
           completedAnswer = completed.answer;
           completedArtifacts = completed.artifacts ?? [];
+          // Ensure the card is sent (even if no content updates arrived)
+          await flushStream();
           await controller.setContent(answerTextForDelivery(completedAnswer, completedArtifacts));
         },
       }, { replyTo: messageId });
@@ -3702,6 +4000,10 @@ export class FeishuHarnessBridge {
     requiresMention,
     replyToMessageId,
   }) {
+    if (interaction?.kind === 'approval' && this.#authDir) {
+      return this.#handleApprovalCard(interaction, { key, actor, chatId, requiresMention });
+    }
+
     if (await this.#approvals.handleRequested(interaction, {
       key,
       actor,
