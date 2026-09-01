@@ -230,6 +230,10 @@ export class VerifiedFeishuChannel {
         rotate: async () => {
           if (rotating) return;
           rotating = true;
+          // Ensure the card is sent before finalizing (deferred-send model).
+          if (!activeCard.messageId) {
+            activeCard.messageId = await this.#sendCard(activeCard.chatId, activeCard.cardId, activeCard.replyTo);
+          }
           try {
             await this.#updateStreamCard(
               activeCard,
@@ -242,13 +246,13 @@ export class VerifiedFeishuChannel {
           }
         },
         setContent: async (content) => {
-          // Ensure the card is sent before any content update.
-          if (!activeCard.messageId && !_sendPromise) {
-            _sendPromise = this.#sendCard(activeCard.chatId, activeCard.cardId, activeCard.replyTo);
-            activeCard.messageId = await _sendPromise;
-          }
           const next = String(content ?? '') || '…';
           const card = await ensureActiveCard();
+          // Ensure the card is sent before any content update
+          // (covers both the first card and rotated cards).
+          if (!card.messageId) {
+            card.messageId = await this.#sendCard(card.chatId, card.cardId, card.replyTo);
+          }
           await this.#updateStreamCard(card, streamPreview(next));
           // Updates are replaceable snapshots, including progress/tool text.
           // Retain the full latest snapshot even when its preview is unchanged.
@@ -258,6 +262,7 @@ export class VerifiedFeishuChannel {
           if (!activeCard.messageId && !_sendPromise) {
             _sendPromise = this.#sendCard(activeCard.chatId, activeCard.cardId, activeCard.replyTo);
             activeCard.messageId = await _sendPromise;
+            _sendPromise = null;
           }
         },
       };
