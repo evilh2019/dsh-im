@@ -583,8 +583,13 @@ export class HarnessReplyTracker {
       if (event.type === 'assistant/chunk' && event.data?.chunk?.type === 'text-delta') {
         const step = event.data?.step ?? 0;
         const index = event.data.chunk.index ?? 0;
-        this.#assistantText.appendDelta(step, index, event.data.chunk.text);
-        this.#commitText(this.#assistantText.text, pushUpdate);
+        const key = `${step}:${index}`;
+        this.#stepText.set(key, (this.#stepText.get(key) ?? '') + event.data.chunk.text);
+        const text = [...this.#stepText.entries()]
+          .filter(([k]) => k.startsWith(`${step}:`))
+          .sort(([a], [b]) => Number(a.split(':')[1]) - Number(b.split(':')[1]))
+          .map(([, v]) => v).join('\n').trim();
+        if (text && text !== this.#latestText) { this.#latestText = text; pushUpdate({ type: 'text', text }); }
         continue;
       }
 
@@ -610,11 +615,12 @@ export class HarnessReplyTracker {
       if (event.type === 'assistant/message') {
         const text = assistantMessageText(event);
         const step = Number.isSafeInteger(event.data?.step) ? event.data.step : null;
-        this.#assistantText.setCanonical(step, text);
-        // canonical 定稿且非空时按 step 透出，供分步推送消费方使用；
-        // 先于 commitText 透出，保持 text 更新作为批次末尾的既有语义。
+        if (step !== null) {
+          this.#stepText.set(`${step}:canonical`, text);
+          this.#latestText = text;
+        }
         if (text) pushUpdate({ type: 'assistant-message', step, text });
-        this.#commitText(this.#assistantText.text, pushUpdate);
+        if (step !== null && text) pushUpdate({ type: 'text', text });
         continue;
       }
 
