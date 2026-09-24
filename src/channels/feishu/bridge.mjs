@@ -5644,6 +5644,14 @@ let streamSent = false;
               console.warn('[dsh-feishu] onInteraction received:', interaction?.kind);
               if ((interaction?.kind === 'question' || interaction?.kind === 'approval')
                 && typeof controller?.rotate === 'function') {
+                // Write buffered progress before the swap. rotate() freezes the prefix the old
+                // card actually shows; a buffered write that lands AFTER rotate() leaves
+                // activeTextPrefix null, so nothing is frozen and the post-swap card replays the
+                // whole snapshot instead of only the delta.
+                if (!streamSent && bufferedContent !== null) {
+                  await controller.setContent(bufferedContent, { transient: bufferedTransient });
+                  bufferedContent = null;
+                }
                 await controller.rotate();
               }
               if (interaction?.kind === 'approval') {
