@@ -5670,19 +5670,29 @@ let streamSent = false;
               if (interaction?.kind === 'approval') {
                 approvalPending = true;
               }
-              // Let the interaction text be sent first, then flush the card
+              // Let the interaction text be sent first, then flush the card.
+              // Awaited on purpose: a fire-and-forget flush races the next onUpdate, which
+              // then still sees `streamSent === false` and overwrites the buffered content.
               await baseOptions.onInteraction(interaction);
+              // issue #163: release the rotation hold once the interaction message is on
+              // screen. Upstream did this in a `finally`; the deferred-send rewrite dropped
+              // it, so `awaitingPresentation` stayed set for the rest of the producer and
+              // every later setContent returned early — the post-rotation card was never
+              // written or sent.
+              if (typeof controller?.interactionPresented === 'function') {
+                controller.interactionPresented();
+              }
               console.warn('[dsh-feishu] interaction text sent — flushing card');
-              flushStream().catch(() => {});
+              await flushStream().catch(() => {});
             },
-            onInteractionResolved: (resolution) => {
+            onInteractionResolved: async (resolution) => {
               console.warn('[dsh-feishu] onInteractionResolved:', resolution?.kind);
               if (resolution?.kind === 'approval') {
                 approvalPending = false;
                 approvalResolved = true;
               }
               console.warn('[dsh-feishu] interaction resolved — flushing card');
-              flushStream().catch(() => {});
+              await flushStream().catch(() => {});
               return baseOptions.onInteractionResolved(resolution);
             },
           };
