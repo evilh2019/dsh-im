@@ -3083,23 +3083,6 @@ export class FeishuHarnessBridge {
    *   - always   → allowed-once + approval/grant(always)  （始终允许）
    */
 
-  async #patchCardMessage(chatId, messageId, cardJson) {
-    if (!messageId) return null;
-    try {
-      const response = await this.#client.im.v1.message.patch({
-        path: { message_id: messageId },
-        data: { content: cardJson },
-      });
-      if (response?.code && response.code !== 0) {
-        throw new Error(`Feishu card update failed: ${response.msg || response.code}`);
-      }
-      return messageId;
-    } catch (error) {
-      this.#logger.warn?.('[dsh-feishu] answered-state card patch failed:', error?.message ?? error);
-      return null;
-    }
-  }
-
   async #handleApprovalCardAction({ approvalId, decision, grant, messageId, operatorOpenId }) {
     const entry = this.#approvalCardMessages.get(messageId);
     if (!entry) return;
