@@ -187,7 +187,7 @@ export class HarnessApprovalQueue {
             if (!presentedWhenClaimed || !pending.presented) {
               if (!pending.presented) await this.#present(pending);
               if (pending.inactive || pending.resolving) return;
-              if (!pending.present) await send(t(APPROVAL_PROMPT));
+              if (!pending.present && !pending.render) await send(t(APPROVAL_PROMPT));
               return;
             }
             if (pending.submitting) {
@@ -195,7 +195,7 @@ export class HarnessApprovalQueue {
               return;
             }
             if (!decision) {
-              if (!pending.present) await send(t(APPROVAL_PROMPT));
+              if (!pending.present && !pending.render) await send(t(APPROVAL_PROMPT));
               return;
             }
             await this.#submit(pending, decision);
@@ -273,8 +273,12 @@ export class HarnessApprovalQueue {
       actor,
       requiresMention: context.requiresMention === true,
       send,
-present,
+      // Both presentation contracts must be carried into the pending entry; the queue
+      // reads `present` first and falls back to `render`. Copying only `present` left
+      // callers that still pass `render` without a renderer at all.
+      present,
       notify,
+      render,
       text,
       presented: false,
       presentationTask: null,
@@ -400,9 +404,16 @@ present,
     if (this.#routes.get(pending.key)?.items[0] !== pending
       || pending.inactive || pending.resolving || pending.presented) return;
     if (pending.presentationTask) return pending.presentationTask;
-const task = pending.present
+    // Two presentation contracts coexist: the local `present` handler (Feishu auth-card
+    // path) and the upstream `render` handler (the default Feishu approval path and any
+    // other channel using this shared queue). Prefer `present`, fall back to `render`,
+    // then to the plain-text prompt. Reading only `present` silently downgraded every
+    // upstream approval card to a text message.
+    const task = pending.present
       ? Promise.resolve().then(() => pending.present(pending))
-      : Promise.resolve().then(() => pending.send(pending.text));
+      : pending.render
+        ? Promise.resolve().then(() => pending.render(pending, pending.send))
+        : Promise.resolve().then(() => pending.send(pending.text));
     pending.presentationTask = task;
     try {
       await task;

@@ -5625,6 +5625,7 @@ let streamSent = false;
           let approvalPending = false;
           let approvalResolved = false;
           let bufferedContent = null;
+          let bufferedTransient = false;
           const sendStream = async () => {
             if (!streamSent) {
               streamSent = true;
@@ -5635,7 +5636,7 @@ let streamSent = false;
           const flushStream = async () => {
             if (streamSent) return;
             if (bufferedContent) {
-              await controller.setContent(bufferedContent);
+              await controller.setContent(bufferedContent, { transient: bufferedTransient });
               bufferedContent = null;
             }
             await sendStream();
@@ -5646,11 +5647,16 @@ let streamSent = false;
             onUpdate: async (update) => {
               const text = this.#progressText(update);
               this.#status.streamUpdates = (this.#status.streamUpdates ?? 0) + 1;
+              // `transient` marks tool/status text that is displayed but must NOT advance
+              // the answer prefix. Upstream passed it here; the rewrite dropped it, so a
+              // tool status was treated as answer content and replayed after the swap.
+              const transient = update.type !== 'text';
               if (!streamSent) {
                 bufferedContent = text;
+                bufferedTransient = transient;
                 console.warn('[dsh-feishu] buffering card, waiting for onInteraction');
               } else {
-                await controller.setContent(text);
+                await controller.setContent(text, { transient });
               }
             },
             // issue #86：独立交互消息（提问/审批）会落在占位卡下方，呈现前
