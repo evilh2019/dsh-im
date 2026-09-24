@@ -271,9 +271,7 @@ export class VerifiedFeishuChannel {
           rotating = true;
           awaitingPresentation = true;
           // Ensure the card is sent before finalizing (deferred-send model).
-          if (!activeCard.messageId) {
-            activeCard.messageId = await this.#sendCard(activeCard.chatId, activeCard.cardId, activeCard.replyTo);
-          }
+          await this.#ensureCardSent(activeCard);
           const shownPrefix = shownPrefixOf(activeView);
           try {
             await this.#updateStreamCard(
@@ -299,9 +297,7 @@ export class VerifiedFeishuChannel {
           if (awaitingPresentation) return; // 换卡挂起：视图已推进，仅挂起卡片写入
           const card = await ensureActiveCard();
           // Ensure the card is sent before any content update (deferred-send model).
-          if (!card.messageId) {
-            card.messageId = await this.#sendCard(card.chatId, card.cardId, card.replyTo);
-          }
+          await this.#ensureCardSent(card);
           await this.#updateStreamCard(card, streamPreview(visible));
           activeView = visible;
           const previousPrefix = frozenContent !== null && next.startsWith(frozenContent)
@@ -325,6 +321,9 @@ export class VerifiedFeishuChannel {
             ? await ensureActiveCard()
             : await this.#createStreamCard(chatId, options);
           if (index > 0) cards.push(card);
+          // Deliver before writing: the final chunk set used to update and finish cards
+          // that were never sent, leaving their messageId null.
+          await this.#ensureCardSent(card);
           await this.#updateStreamCard(card, chunk);
           await this.#finishStreamCard(card);
         }
@@ -515,9 +514,18 @@ export class VerifiedFeishuChannel {
     const cardId = response?.data?.card_id;
     if (!cardId) throw new Error('Feishu card.create returned no card_id');
     const replyTo = options?.replyTo;
-    // Delay sending: the card is created but not sent until setContent
-    // has actual content, so approval cards appear first.
-    return { cardId, messageId: null, chatId, replyTo, content, sequence: 0 };
+    // Delay sending: the card is created but not sent until setContent has actual
+    // content, so approval cards appear first. The FULL send options must travel with
+    // the card: the deferred path used to pass the bare `replyTo` string where
+    // `#sendCard(chatId, cardId, options)` expects an options object, so `options.replyTo`
+    // read as undefined and every card was delivered with `message.create` instead of
+    // `message.reply` — silently dropping replyTo / replyInThread / onReplyThreadId.
+    const sendOptions = {
+      replyTo,
+      replyInThread: options?.replyInThread === true,
+      onReplyThreadId: options?.onReplyThreadId,
+    };
+    return { cardId, messageId: null, chatId, replyTo, sendOptions, content, sequence: 0 };
   }
 
   async #updateStreamCard(card, content) {
@@ -549,6 +557,23 @@ export class VerifiedFeishuChannel {
       },
     });
     assertApiSuccess('Feishu card.settings', response);
+  }
+
+  /**
+   * Deferred-send guard: a stream card exists in cardkit before it is delivered, so
+   * cardElement.content / card.settings succeed against a card nobody can see yet.
+   * Every path that writes to or finalizes a card must send it first, or the card keeps
+   * `messageId: null` and `providerMessageIds` reports a hole for it.
+   */
+  async #ensureCardSent(card) {
+    if (!card.messageId) {
+      card.messageId = await this.#sendCard(
+        card.chatId,
+        card.cardId,
+        card.sendOptions ?? { replyTo: card.replyTo },
+      );
+    }
+    return card.messageId;
   }
 
   async #sendCard(chatId, cardId, options = {}) {
