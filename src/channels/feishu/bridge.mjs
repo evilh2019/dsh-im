@@ -5249,6 +5249,29 @@ export class FeishuHarnessBridge {
         markdown: async (controller) => {
           promptStarted = true;
           const baseAskOptions = this.#interactionAskOptions(event, key, message.files);
+          // issue #86 / #163：卡片延迟发送。卡片先创建但不投递，等有实质内容（或交互
+          // 消息已呈现）再发；这样提问/审批卡片排在占位卡之前，最终答案落在其后新建的卡上。
+          let streamSent = false;
+          let bufferedContent = null;
+          let bufferedTransient = false;
+          const sendStream = async () => {
+            if (streamSent) return;
+            streamSent = true;
+            if (typeof controller.send === 'function') await controller.send();
+          };
+          const takeBuffered = () => {
+            if (bufferedContent === null) return null;
+            const pending = { content: bufferedContent, transient: bufferedTransient };
+            bufferedContent = null;
+            return pending;
+          };
+          // 冲掉缓冲快照并标记流已发送。
+          const flushStream = async () => {
+            if (streamSent) return;
+            const pending = takeBuffered();
+            if (pending) await controller.setContent(pending.content, { transient: pending.transient });
+            await sendStream();
+          };
           const askOptions = {
             ...baseAskOptions,
             // issue #86：独立交互消息（提问/审批）会落在占位卡下方，呈现前
@@ -5257,6 +5280,10 @@ export class FeishuHarnessBridge {
               try {
                 if ((interaction?.kind === 'question' || interaction?.kind === 'approval')
                   && typeof controller?.rotate === 'function') {
+                  // rotate() 以「旧卡实际展示的内容」为冻结基线，并据此剥离新卡的重复前缀。
+                  // 缓冲快照必须先落地，否则基线为空，新卡会重放整段快照。
+                  const pending = takeBuffered();
+                  if (pending) await controller.setContent(pending.content, { transient: pending.transient });
                   await controller.rotate();
                 }
                 await baseAskOptions.onInteraction(interaction);
@@ -5265,12 +5292,19 @@ export class FeishuHarnessBridge {
                 // 必然位于交互消息下方；interactionPresented 不存在时静默跳过。
                 controller?.interactionPresented?.();
               }
+              // 交互消息此时已在旧卡下方，再发送卡片即可保证顺序。
+              await flushStream().catch(() => undefined);
             },
             onUpdate: async (update) => {
-              await controller.setContent(this.#progressText(update), {
-                transient: update.type !== 'text',
-              });
+              const text = this.#progressText(update);
               this.#status.streamUpdates = (this.#status.streamUpdates ?? 0) + 1;
+              const transient = update.type !== 'text';
+              if (!streamSent) {
+                bufferedContent = text;
+                bufferedTransient = transient;
+              } else {
+                await controller.setContent(text, { transient });
+              }
             },
           };
           const completed = await askInWorkspaceSession({
@@ -5288,6 +5322,8 @@ export class FeishuHarnessBridge {
           markAskComplete();
           completedAnswer = completed.answer;
           completedArtifacts = completed.artifacts ?? [];
+          // 即使没有任何进度更新也要把卡片发出去（延迟发送的兜底）。
+          await flushStream().catch(() => undefined);
           await controller.setContent(answerTextForDelivery(completedAnswer, completedArtifacts));
         },
       }, {
