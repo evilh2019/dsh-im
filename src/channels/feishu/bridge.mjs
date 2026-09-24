@@ -2800,6 +2800,27 @@ export class FeishuHarnessBridge {
   }
 
   /**
+   * issue #162：已答状态卡的原地替换。patch 失败仅记录警告并明确降级——
+   * 回执缺失不应影响答案提交，也不得像 #sendCard 那样回退成发送新卡。
+   */
+  async #patchCardMessage(chatId, messageId, cardJson) {
+    if (!messageId) return null;
+    try {
+      const response = await this.#client.im.v1.message.patch({
+        path: { message_id: messageId },
+        data: { content: cardJson },
+      });
+      if (response?.code && response.code !== 0) {
+        throw new Error(`Feishu card update failed: ${response.msg || response.code}`);
+      }
+      return messageId;
+    } catch (error) {
+      this.#logger.warn?.('[dsh-feishu] answered-state card patch failed:', error?.message ?? error);
+      return null;
+    }
+  }
+
+  /**
    * Authorization-card callback (auth_request.py). The card buttons carry
    * `{ auth_id, decision: 'approve'|'deny', grant }` with no `action` field.
    * Resolves the pending state file under `authDir` and patches the card to
